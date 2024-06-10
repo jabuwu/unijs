@@ -1,6 +1,8 @@
+use serde::{de::DeserializeOwned, Serialize};
+
 use crate::Scope;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Value {
     Undefined,
     Null,
@@ -101,6 +103,46 @@ impl Value {
         }
     }
 
+    pub fn is_undefined(self) -> bool {
+        matches!(self, Self::Undefined)
+    }
+
+    pub fn is_null(self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    pub fn is_bool(self) -> bool {
+        matches!(self, Self::Bool(..))
+    }
+
+    pub fn is_number(self) -> bool {
+        matches!(self, Self::Number(..))
+    }
+
+    pub fn is_string(self) -> bool {
+        matches!(self, Self::String(..))
+    }
+
+    pub fn is_array(self) -> bool {
+        matches!(self, Self::Array(..))
+    }
+
+    pub fn is_object(self) -> bool {
+        matches!(self, Self::Object(..))
+    }
+
+    pub fn is_function(self) -> bool {
+        matches!(self, Self::Function(..))
+    }
+
+    pub fn into_bool(self) -> Option<bool> {
+        if let Value::Bool(bool) = self {
+            Some(bool)
+        } else {
+            None
+        }
+    }
+
     pub fn into_number(self) -> Option<f64> {
         if let Value::Number(number) = self {
             Some(number)
@@ -140,23 +182,102 @@ impl Value {
             None
         }
     }
-}
 
-impl From<Object> for Value {
-    fn from(value: Object) -> Self {
-        Value::Object(value)
+    pub fn into_json(self, scope: &mut Scope) -> Option<serde_json::Value> {
+        match self {
+            Self::Undefined => None,
+            Self::Null => Some(serde_json::Value::Null),
+            Self::Bool(value) => Some(serde_json::Value::Bool(value)),
+            Self::Number(value) => {
+                let number = if value as u64 as f64 == value {
+                    serde_json::from_str::<serde_json::Number>(&format!("{}", value as u64)).unwrap()
+                } else if value as i64 as f64 == value {
+                    serde_json::from_str::<serde_json::Number>(&format!("{}", value as i64)).unwrap()
+                } else {
+                    serde_json::Number::from_f64(value).unwrap()
+                };
+                Some(serde_json::Value::Number(number))
+            }
+            Self::String(value) => Some(serde_json::Value::String(value)),
+            Self::Array(value) => {
+                let mut array = vec![];
+                for i in 0..value.length(scope) {
+                    let item = value.get(scope, i);
+                    if let Some(json) = item.into_json(scope) {
+                        array.push(json);
+                    } else {
+                        array.push(serde_json::Value::Null);
+                    }
+                }
+                Some(serde_json::Value::Array(array))
+            }
+            Self::Object(value) => {
+                let mut map = serde_json::Map::new();
+                for key in value.keys(scope) {
+                    if let Some(value) = value.get(scope, &key).into_json(scope) {
+                        map.insert(key, value);
+                    }
+                }
+                Some(serde_json::Value::Object(map))
+            }
+            Self::Function(..) => None,
+        }
+    }
+
+    pub fn from_json(scope: &mut Scope, json: serde_json::Value) -> Self {
+        match json {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(value) => Self::Bool(value),
+            serde_json::Value::Number(value) => Self::Number(value.as_f64().unwrap()),
+            serde_json::Value::String(value) => Self::String(value),
+            serde_json::Value::Array(value) => {
+                let array = Array::new(scope);
+                for item in value {
+                    let item = Value::from_json(scope, item);
+                    array.push(scope, item);
+                }
+                Self::Array(array)
+            }
+            serde_json::Value::Object(value) => {
+                let object = Object::new(scope);
+                for (key, value) in value {
+                    let item = Value::from_json(scope, value);
+                    object.set(scope, &key, item);
+                }
+                Self::Object(object)
+            }
+        }
+    }
+
+    pub fn serialize<T: Serialize>(scope: &mut Scope, value: &T) -> Option<Self> {
+        if let Ok(json) = serde_json::to_value(&value) {
+            Some(Self::from_json(scope, json))
+        } else {
+            None
+        }
+    }
+
+    pub fn deserialize<T: DeserializeOwned>(self, scope: &mut Scope) -> Option<T> {
+        if let Some(json) = self.into_json(scope) {
+            serde_json::from_value::<T>(json).ok()
+        } else {
+            None
+        }
     }
 }
 
-impl From<Array> for Value {
-    fn from(value: Array) -> Self {
-        Value::Array(value)
-    }
-}
-
-impl From<Function> for Value {
-    fn from(value: Function) -> Self {
-        Value::Function(value)
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Undefined => f.write_str("undefined"),
+            Self::Null => f.write_str("null"),
+            Self::Bool(value) => value.fmt(f),
+            Self::Number(value) => value.fmt(f),
+            Self::String(value) => value.fmt(f),
+            Self::Array(value) => value.fmt(f),
+            Self::Object(value) => value.fmt(f),
+            Self::Function(value) => value.fmt(f),
+        }
     }
 }
 
@@ -213,6 +334,61 @@ impl Array {
     }
 
     #[allow(unused_variables)]
+    pub fn length(&self, scope: &mut Scope) -> u32 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let array = self.array.clone();
+            scope.enter(move |scope| {
+                let array = v8::Local::new(scope, array);
+                array.length()
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.array.length()
+        }
+    }
+
+    #[allow(unused_variables)]
+    pub fn get(&self, scope: &mut Scope, index: u32) -> Value {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let array = self.array.clone();
+            scope.enter(move |scope| {
+                let array = v8::Local::new(scope, array);
+                let key = v8::Number::new(scope, index as f64);
+                if let Some(value) = array.get(scope, key.into()) {
+                    Value::from_v8(scope, value)
+                } else {
+                    Value::Undefined
+                }
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Value::from_web(self.array.get(index))
+        }
+    }
+
+    #[allow(unused_variables)]
+    pub fn set(&self, scope: &mut Scope, index: u32, value: Value) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let array = self.array.clone();
+            scope.enter(move |scope| {
+                let array = v8::Local::new(scope, array);
+                let key = v8::Number::new(scope, index as f64);
+                let value = value.to_v8(scope);
+                array.set(scope, key.into(), value);
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.array.set(index, value.to_web())
+        }
+    }
+
+    #[allow(unused_variables)]
     pub fn push(&self, scope: &mut Scope, value: Value) {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -232,9 +408,15 @@ impl Array {
     }
 }
 
-impl std::fmt::Debug for Object {
+impl std::fmt::Debug for Array {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Object")
+        f.write_str(&format!("[array]"))
+    }
+}
+
+impl From<Array> for Value {
+    fn from(value: Array) -> Self {
+        Value::Array(value)
     }
 }
 
@@ -336,11 +518,51 @@ impl Object {
             .unwrap();
         }
     }
+
+    #[allow(unused_variables)]
+    pub fn keys(&self, scope: &mut Scope) -> Vec<String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let object = self.object.clone();
+            scope.enter(move |scope| {
+                let object = v8::Local::new(scope, object);
+                let names = object.get_own_property_names(scope, v8::GetPropertyNamesArgs::default()).unwrap();
+                let mut keys = vec![];
+                for i in 0..names.length() {
+                    let i_key = v8::Number::new(scope, i as f64);
+                    if let Some(name) = names.get(scope, i_key.into()) {
+                        let name = Value::from_v8(scope, name);
+                        if let Some(name) = name.into_string() {
+                            keys.push(name);
+                        }
+                    }
+                }
+                keys
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut keys = vec![];
+            let object_keys = js_sys::Reflect::own_keys(&self.object.clone().into()).unwrap();
+            for item in object_keys {
+                if let Some(name) = item.as_string() {
+                    keys.push(name);
+                }
+            }
+            keys
+        }
+    }
 }
 
-impl std::fmt::Debug for Array {
+impl std::fmt::Debug for Object {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Array")
+        f.write_str("[object]")
+    }
+}
+
+impl From<Object> for Value {
+    fn from(value: Object) -> Self {
+        Value::Object(value)
     }
 }
 
@@ -379,8 +601,7 @@ impl Function {
     }
 
     #[allow(unused_variables)]
-    pub fn new(scope: &mut Scope, f: fn(&mut Scope, Args) -> Value) -> Self
-    {
+    pub fn new(scope: &mut Scope, f: fn(&mut Scope, Args) -> Value) -> Self {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let function = scope.enter(|scope| {
@@ -389,7 +610,11 @@ impl Function {
                     |v8_scope: &mut v8::HandleScope<'_>,
                      v8_args: v8::FunctionCallbackArguments<'_>,
                      mut v8_ret: v8::ReturnValue<'_>| {
-                        let f: fn(&mut Scope, Args) -> Value = unsafe { std::mem::transmute(v8_args.data().number_value(v8_scope).unwrap() as usize) };
+                        let f: fn(&mut Scope, Args) -> Value = unsafe {
+                            std::mem::transmute(
+                                v8_args.data().number_value(v8_scope).unwrap() as usize
+                            )
+                        };
                         let mut args = Args { args: vec![] };
                         for i in 0..v8_args.length() {
                             args.args.push(Value::from_v8(v8_scope, v8_args.get(i)));
@@ -471,7 +696,13 @@ impl Function {
 
 impl std::fmt::Debug for Function {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Function")
+        f.write_str("[function]")
+    }
+}
+
+impl From<Function> for Value {
+    fn from(value: Function) -> Self {
+        Value::Function(value)
     }
 }
 
@@ -487,7 +718,7 @@ impl Args {
             .unwrap_or_else(|| Value::Undefined)
     }
 
-    pub fn length(&self) -> usize {
-        self.args.len()
+    pub fn length(&self) -> u32 {
+        self.args.len() as u32
     }
 }

@@ -3,6 +3,10 @@ name = "unijs"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+serde = "1.0.203"
+serde_json = "1.0.117"
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 v8 = "0.92.0"
 
@@ -17,6 +21,7 @@ web-sys = { version = "0.3.66", features = [
 ] }
 
 [dev-dependencies]
+serde = { version = "1.0.203", features = ["derive"] }
 tokasm = { git = "https://github.com/jabuwu/tokasm", rev = "6999ab9d0bee6d936815c5d7751573d6290a929c" }
 tracing = "0.1.40"
 unilog = { git = "https://github.com/jabuwu/unilog" }
